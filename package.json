@@ -1,1 +1,20 @@
-
+{
+  "name": "nexo",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "api:build": "npm run build -w apps/api",
+    "api:start": "npm run start -w apps/api",
+    "api:dev": "npm run start:dev -w apps/api",
+    "api:test": "npm run test -w apps/api",
+    "api:test:e2e": "npm run test:e2e -w apps/api",
+    "api:prisma:generate": "npm run prisma:generate -w apps/api",
+    "api:prisma:migrate": "npm run prisma:migrate -w apps/api",
+    "api:prisma:seed": "npm run prisma:seed -w apps/api",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down"
+  }
+}
