@@ -1,0 +1,616 @@
+// Nexo API — Prisma schema
+// Foundation (Phase 0) + Core Commerce (Phase 1) subset of the full SRS schema
+// (see /docs/srs/04-database-schema.md for the complete, target enterprise schema).
+// Simplifications vs. the full SRS are called out inline with "SIMPLIFICATION:".
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum StoreStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum BranchType {
+  WAREHOUSE
+  RETAIL
+  PICKUP_POINT
+  HYBRID
+}
+
+enum BranchStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum StaffUserStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+  LOCKED
+}
+
+enum TwoFactorMethod {
+  TOTP
+  SMS
+}
+
+// Scope hierarchy: GLOBAL > STORE > BRANCH > SELF (COUNTRY omitted in this
+// foundation subset — see docs/srs/03-multi-tenancy-globalization.md).
+enum ScopeType {
+  GLOBAL
+  STORE
+  BRANCH
+  SELF
+}
+
+enum PermissionEffect {
+  GRANT
+  DENY
+}
+
+enum ProductType {
+  SIMPLE
+  VARIABLE
+  DIGITAL
+  BUNDLE
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum StockMovementType {
+  SALE
+  RETURN
+  ADJUSTMENT
+  TRANSFER_IN
+  TRANSFER_OUT
+  PURCHASE_RECEIPT
+  INITIAL
+  RELEASE
+}
+
+enum CartStatus {
+  ACTIVE
+  CONVERTED
+  ABANDONED
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  PARTIALLY_SHIPPED
+  SHIPPED
+  DELIVERED
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum OrderChannel {
+  STOREFRONT
+  WHATSAPP
+  POS
+  MANUAL_ADMIN
+}
+
+enum ActorType {
+  STAFF
+  CUSTOMER
+  SYSTEM
+  API_CLIENT
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy (docs/srs/03, 04 §4.2)
+// ---------------------------------------------------------------------------
+
+model Tenant {
+  id                String       @id @default(uuid())
+  name              String
+  // SIMPLIFICATION: informational only; StaffUser.isOwner is the enforced
+  // source of truth checked by the authorization service (docs/srs/02 §2.2.2).
+  ownerStaffUserId  String?
+  status            TenantStatus @default(ACTIVE)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  stores     Store[]
+  staffUsers StaffUser[]
+  roles      Role[]
+  auditLogs  AuditLog[]
+
+  @@map("tenants")
+}
+
+model Store {
+  id              String      @id @default(uuid())
+  tenantId        String
+  tenant          Tenant      @relation(fields: [tenantId], references: [id])
+  name            String
+  slug            String
+  defaultCountry  String?
+  defaultCurrency String      @default("USD")
+  defaultLanguage String      @default("en")
+  baseCurrency    String      @default("USD")
+  status          StoreStatus @default(ACTIVE)
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  branches Branch[]
+  products Product[]
+  carts    Cart[]
+  orders   Order[]
+  brands   Brand[]
+  categories Category[]
+
+  @@unique([tenantId, slug])
+  @@map("stores")
+}
+
+model Branch {
+  id          String       @id @default(uuid())
+  storeId     String
+  store       Store        @relation(fields: [storeId], references: [id])
+  name        String
+  type        BranchType   @default(RETAIL)
+  status      BranchStatus @default(ACTIVE)
+  countryCode String?
+  city        String?
+  timezone    String       @default("UTC")
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  inventory    Inventory[]
+  staffRoles   StaffUserRole[]
+  orders       Order[]
+
+  @@map("branches")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & RBAC (docs/srs/02, 04 §4.2)
+// ---------------------------------------------------------------------------
+
+model StaffUser {
+  id               String           @id @default(uuid())
+  tenantId         String
+  tenant           Tenant           @relation(fields: [tenantId], references: [id])
+  email            String
+  passwordHash     String
+  isOwner          Boolean          @default(false)
+  status           StaffUserStatus  @default(ACTIVE)
+  twoFactorEnabled Boolean          @default(false)
+  twoFactorMethod  TwoFactorMethod?
+  twoFactorSecret  String?
+  failedLoginCount Int              @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  roles      StaffUserRole[]
+  overrides  UserPermissionOverride[]
+  sessions   Session[]
+
+  @@unique([tenantId, email])
+  @@map("staff_users")
+}
+
+// A Role's "rank" enforces docs/srs/02 §2.2.2 / §2.3: a principal can never
+// manage (assign/edit/delete) a staff user whose highest role has rank <= their own,
+// except the Owner (isOwner = true), who is exempt from the rank check entirely.
+model Role {
+  id        String   @id @default(uuid())
+  tenantId  String?
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id])
+  name      String
+  rank      Int
+  isSystem  Boolean  @default(false)
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+
+  permissions RolePermission[]
+  staffUsers  StaffUserRole[]
+
+  @@map("roles")
+}
+
+// Global, tenant-independent catalog of (resource, action) pairs — seeded once.
+model Permission {
+  id          String  @id @default(uuid())
+  resource    String
+  action      String
+  description String?
+
+  rolePermissions RolePermission[]
+  overrides       UserPermissionOverride[]
+
+  @@unique([resource, action])
+  @@map("permissions")
+}
+
+// A RolePermission is a *template*: it says WHAT (resource/action) a role
+// grants and AT WHAT SCOPE TIER (scopeType), but not WHICH concrete
+// store/branch — that concrete scope comes from the StaffUserRole
+// *assignment* below. This lets one "Manager" role be assigned to different
+// staff users at different branches without duplicating the role.
+model RolePermission {
+  id           String     @id @default(uuid())
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id])
+  scopeType    ScopeType  @default(GLOBAL)
+  conditions   Json?
+
+  @@unique([roleId, permissionId, scopeType])
+  @@map("role_permissions")
+}
+
+// The concrete scope of a role assignment (docs/srs/02 §2.5.2): e.g. "staff
+// user X has role Manager at branch Y". storeId/branchId are null for
+// GLOBAL-tier roles (Owner/Super Admin).
+model StaffUserRole {
+  id          String    @id @default(uuid())
+  staffUserId String
+  staffUser   StaffUser @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+  roleId      String
+  role        Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  storeId     String?
+  branchId    String?
+  branch      Branch?   @relation(fields: [branchId], references: [id])
+  createdAt   DateTime  @default(now())
+
+  @@unique([staffUserId, roleId, storeId, branchId])
+  @@map("staff_user_roles")
+}
+
+// Individual grant/deny exceptions layered on top of role grants; deny always
+// wins (docs/srs/02 §2.5.3, step 5). expiresAt supports temporary elevation.
+model UserPermissionOverride {
+  id           String           @id @default(uuid())
+  staffUserId  String
+  staffUser    StaffUser        @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission       @relation(fields: [permissionId], references: [id])
+  effect       PermissionEffect
+  scopeType    ScopeType        @default(GLOBAL)
+  scopeId      String?
+  expiresAt    DateTime?
+  reason       String?
+  createdAt    DateTime         @default(now())
+
+  @@map("user_permission_overrides")
+}
+
+// Refresh-token sessions with rotation/reuse detection (docs/srs/13 §13.1.1).
+model Session {
+  id               String    @id @default(uuid())
+  staffUserId      String
+  staffUser        StaffUser @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+  refreshTokenHash String
+  familyId         String
+  ipAddress        String?
+  userAgent        String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([familyId])
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (docs/srs/05)
+// SIMPLIFICATION: single-language fields (no product_translations table yet),
+// variant options stored as JSON instead of a full options/option-values model.
+// ---------------------------------------------------------------------------
+
+model Brand {
+  id        String   @id @default(uuid())
+  tenantId  String
+  storeId   String
+  store     Store    @relation(fields: [storeId], references: [id])
+  name      String
+  slug      String
+  createdAt DateTime @default(now())
+
+  products Product[]
+
+  @@unique([storeId, slug])
+  @@map("brands")
+}
+
+model Category {
+  id        String     @id @default(uuid())
+  tenantId  String
+  storeId   String
+  store     Store      @relation(fields: [storeId], references: [id])
+  parentId  String?
+  parent    Category?  @relation("CategoryToCategory", fields: [parentId], references: [id])
+  children  Category[] @relation("CategoryToCategory")
+  name      String
+  slug      String
+  sortOrder Int        @default(0)
+  isActive  Boolean    @default(true)
+
+  products ProductCategory[]
+
+  @@unique([storeId, slug])
+  @@map("categories")
+}
+
+model Product {
+  id                  String        @id @default(uuid())
+  tenantId            String
+  storeId             String
+  store               Store         @relation(fields: [storeId], references: [id])
+  brandId             String?
+  brand               Brand?        @relation(fields: [brandId], references: [id])
+  type                ProductType   @default(SIMPLE)
+  status              ProductStatus @default(DRAFT)
+  name                String
+  slug                String
+  description         String?
+  skuPrefix           String?
+  basePriceMinorUnits Int
+  currency            String        @default("USD")
+  taxRatePercent      Decimal       @default(0) @db.Decimal(5, 2)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  categories ProductCategory[]
+  variants   ProductVariant[]
+
+  @@unique([storeId, slug])
+  @@index([storeId, status])
+  @@map("products")
+}
+
+model ProductCategory {
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([productId, categoryId])
+  @@map("product_categories")
+}
+
+model ProductVariant {
+  id                      String        @id @default(uuid())
+  productId               String
+  product                 Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku                     String        @unique
+  optionsJson             Json?
+  priceOverrideMinorUnits Int?
+  status                  ProductStatus @default(ACTIVE)
+  createdAt               DateTime      @default(now())
+
+  inventory  Inventory[]
+  orderItems OrderItem[]
+  cartItems  CartItem[]
+
+  @@map("product_variants")
+}
+
+// ---------------------------------------------------------------------------
+// Inventory (docs/srs/05 §5.2)
+// ---------------------------------------------------------------------------
+
+model Inventory {
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  branchId         String
+  branch           Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  quantityOnHand   Int            @default(0)
+  quantityReserved Int            @default(0)
+  reorderPoint     Int            @default(0)
+  updatedAt        DateTime       @updatedAt
+
+  @@id([productVariantId, branchId])
+  @@map("inventory")
+}
+
+// Append-only ledger — never updated/deleted by application code
+// (docs/srs/05 §5.2.3, docs/srs/11 §11.3.1 immutability principle).
+model StockMovement {
+  id                     String            @id @default(uuid())
+  productVariantId       String
+  branchId               String
+  quantityDelta          Int
+  type                   StockMovementType
+  referenceType          String?
+  referenceId            String?
+  reason                 String?
+  performedByStaffUserId String?
+  createdAt              DateTime          @default(now())
+
+  @@index([productVariantId, branchId, createdAt])
+  @@map("stock_movements")
+}
+
+// ---------------------------------------------------------------------------
+// Customers (docs/srs/09 — minimal subset for order attribution)
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id        String   @id @default(uuid())
+  tenantId  String
+  storeId   String
+  email     String?
+  phone     String?
+  firstName String?
+  lastName  String?
+  createdAt DateTime @default(now())
+
+  addresses Address[]
+  orders    Order[]
+  carts     Cart[]
+
+  @@map("customers")
+}
+
+model Address {
+  id                String   @id @default(uuid())
+  customerId        String
+  customer          Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  recipientName     String
+  phone             String?
+  countryCode       String
+  city              String
+  addressLine1      String
+  addressLine2      String?
+  postalCode        String?
+  isDefaultShipping Boolean  @default(false)
+  isDefaultBilling  Boolean  @default(false)
+
+  @@map("addresses")
+}
+
+// ---------------------------------------------------------------------------
+// Cart, Orders, Fulfillment (docs/srs/06)
+// SIMPLIFICATION: tax/shipping are flat-rate placeholders, not the full
+// tax-jurisdiction/shipping-carrier engines specified in docs/srs/06.
+// ---------------------------------------------------------------------------
+
+model Cart {
+  id         String     @id @default(uuid())
+  storeId    String
+  store      Store      @relation(fields: [storeId], references: [id])
+  customerId String?
+  customer   Customer?  @relation(fields: [customerId], references: [id])
+  currency   String     @default("USD")
+  status     CartStatus @default(ACTIVE)
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  items CartItem[]
+
+  @@map("carts")
+}
+
+model CartItem {
+  id                          String         @id @default(uuid())
+  cartId                      String
+  cart                        Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productVariantId            String
+  productVariant              ProductVariant @relation(fields: [productVariantId], references: [id])
+  quantity                    Int
+  unitPriceMinorUnitsSnapshot Int
+
+  @@map("cart_items")
+}
+
+model Order {
+  id                   String      @id @default(uuid())
+  tenantId             String
+  storeId              String
+  store                Store       @relation(fields: [storeId], references: [id])
+  branchId             String
+  branch               Branch      @relation(fields: [branchId], references: [id])
+  customerId           String?
+  customer             Customer?   @relation(fields: [customerId], references: [id])
+  orderNumber          String      @unique
+  status               OrderStatus @default(PENDING)
+  channel              OrderChannel @default(STOREFRONT)
+  currency             String      @default("USD")
+  subtotalMinorUnits   Int
+  taxMinorUnits        Int
+  shippingMinorUnits   Int
+  totalMinorUnits      Int
+  createdByStaffUserId String?
+  placedAt             DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  items         OrderItem[]
+  statusHistory OrderStatusHistory[]
+
+  @@index([storeId, status, placedAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                  String         @id @default(uuid())
+  orderId             String
+  order               Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productVariantId    String
+  productVariant      ProductVariant @relation(fields: [productVariantId], references: [id])
+  skuSnapshot         String
+  nameSnapshot        String
+  quantity             Int
+  unitPriceMinorUnits Int
+  taxMinorUnits       Int
+  totalMinorUnits     Int
+
+  @@map("order_items")
+}
+
+model OrderStatusHistory {
+  id                    String       @id @default(uuid())
+  orderId               String
+  order                 Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromStatus            OrderStatus?
+  toStatus              OrderStatus
+  changedByStaffUserId  String?
+  note                  String?
+  createdAt             DateTime     @default(now())
+
+  @@map("order_status_history")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-cutting: Audit Log & Idempotency (docs/srs/11 §11.3, docs/srs/06 §6.2.1)
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id           String     @id @default(uuid())
+  tenantId     String?
+  tenant       Tenant?    @relation(fields: [tenantId], references: [id])
+  actorType    ActorType
+  actorId      String?
+  action       String
+  resourceType String
+  resourceId   String?
+  beforeJson   Json?
+  afterJson    Json?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime   @default(now())
+
+  @@index([tenantId, resourceType, resourceId])
+  @@index([actorId, createdAt])
+  @@map("audit_logs")
+}
+
+// Backs the Idempotency-Key header contract (docs/srs/12 §12.1.2).
+model IdempotencyKey {
+  key          String   @id
+  tenantId     String
+  responseJson Json
+  createdAt    DateTime @default(now())
+
+  @@map("idempotency_keys")
+}
