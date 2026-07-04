@@ -1,0 +1,62 @@
+# Meshily Delivery — full stack
+# Usage:
+#   cp backend/.env.example backend/.env   (then edit secrets)
+#   docker compose up -d --build
+#   docker compose exec backend npx prisma db seed
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: meshily
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meshily}
+      POSTGRES_DB: meshily
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meshily"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+
+  backend:
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://meshily:${POSTGRES_PASSWORD:-meshily}@postgres:5432/meshily
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set in .env}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set in .env}
+      OTP_DEV_MODE: ${OTP_DEV_MODE:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      SUPER_ADMIN_PHONE: ${SUPER_ADMIN_PHONE:-}
+      SUPER_ADMIN_EMAIL: ${SUPER_ADMIN_EMAIL:-}
+      SUPER_ADMIN_PASSWORD: ${SUPER_ADMIN_PASSWORD:-}
+      FIREBASE_SERVICE_ACCOUNT_PATH: ${FIREBASE_SERVICE_ACCOUNT_PATH:-}
+    volumes:
+      - uploads:/app/uploads
+    ports:
+      - "4000:4000"
+
+  admin:
+    build: ./admin
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:

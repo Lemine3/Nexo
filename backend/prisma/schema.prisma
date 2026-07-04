@@ -1,0 +1,339 @@
+// Meshily Delivery — Database schema (PostgreSQL)
+// مشيلي للتوصيل — مخطط قاعدة البيانات
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── Enums ───────────────────────────
+
+enum Role {
+  CUSTOMER
+  DRIVER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  BLOCKED
+}
+
+enum VehicleType {
+  MOTO // دراجة نارية
+  TRUCK // شاحنة / سيارة
+}
+
+enum DriverApproval {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum OrderStatus {
+  PENDING // created, searching for a driver
+  ACCEPTED // driver accepted
+  ARRIVED_PICKUP // driver at pickup point
+  PICKED_UP // package collected
+  IN_TRANSIT // on the way to dropoff
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  BANKILY
+  MASRIVI
+  WALLET
+}
+
+enum PaymentStatus {
+  UNPAID
+  PENDING
+  PAID
+  REFUNDED
+}
+
+enum WalletTxType {
+  TOPUP
+  ORDER_PAYMENT
+  EARNING
+  COMMISSION
+  WITHDRAWAL
+  REFUND
+  ADJUSTMENT
+}
+
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAID
+}
+
+enum OtpPurpose {
+  REGISTER
+  LOGIN
+  RESET_PASSWORD
+}
+
+// ─────────────────────────── Models ───────────────────────────
+
+model User {
+  id               String     @id @default(cuid())
+  phone            String     @unique
+  email            String?    @unique
+  passwordHash     String?
+  name             String
+  role             Role       @default(CUSTOMER)
+  status           UserStatus @default(PENDING)
+  language         String     @default("ar") // ar | fr | en
+  avatarUrl        String?
+  fcmToken         String?
+  walletBalance    Decimal    @default(0) @db.Decimal(12, 2)
+  twoFactorSecret  String?
+  twoFactorEnabled Boolean    @default(false)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  driverProfile   DriverProfile?
+  customerOrders  Order[]             @relation("CustomerOrders")
+  driverOrders    Order[]             @relation("DriverOrders")
+  ratingsGiven    Rating[]            @relation("RatingsGiven")
+  ratingsReceived Rating[]            @relation("RatingsReceived")
+  walletTxs       WalletTransaction[]
+  withdrawals     WithdrawalRequest[] @relation("DriverWithdrawals")
+  processedWds    WithdrawalRequest[] @relation("ProcessedWithdrawals")
+  chatMessages    ChatMessage[]
+  auditLogs       AuditLog[]
+  notifications   Notification[]
+  refreshTokens   RefreshToken[]
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model OtpCode {
+  id        String     @id @default(cuid())
+  phone     String
+  code      String
+  purpose   OtpPurpose
+  expiresAt DateTime
+  consumed  Boolean    @default(false)
+  createdAt DateTime   @default(now())
+
+  @@index([phone, purpose])
+}
+
+model DriverProfile {
+  userId          String         @id
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleType     VehicleType
+  plateNumber     String
+  licenseImageUrl String?
+  idCardImageUrl  String?
+  vehicleImageUrl String?
+  approvalStatus  DriverApproval @default(PENDING)
+  rejectionReason String?
+  online          Boolean        @default(false)
+  lastLat         Float?
+  lastLng         Float?
+  lastLocationAt  DateTime?
+  ratingAvg       Float          @default(0)
+  ratingCount     Int            @default(0)
+  totalEarnings   Decimal        @default(0) @db.Decimal(12, 2)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([online, approvalStatus, vehicleType])
+}
+
+model Order {
+  id             String        @id @default(cuid())
+  code           String        @unique // human-friendly short code e.g. MD-20260704-0012
+  customerId     String
+  customer       User          @relation("CustomerOrders", fields: [customerId], references: [id])
+  driverId       String?
+  driver         User?         @relation("DriverOrders", fields: [driverId], references: [id])
+  vehicleType    VehicleType
+  status         OrderStatus   @default(PENDING)
+  packageType    String? // طرد، طعام، مشتريات، بضائع...
+  notes          String?
+  pickupLat      Float
+  pickupLng      Float
+  pickupAddress  String
+  dropoffLat     Float
+  dropoffLng     Float
+  dropoffAddress String
+  distanceKm     Float
+  durationMin    Float
+  price          Decimal       @db.Decimal(12, 2)
+  commission     Decimal       @default(0) @db.Decimal(12, 2)
+  driverEarning  Decimal       @default(0) @db.Decimal(12, 2)
+  paymentMethod  PaymentMethod @default(CASH)
+  paymentStatus  PaymentStatus @default(UNPAID)
+  paymentRef     String?
+  cancelReason   String?
+  acceptedAt     DateTime?
+  pickedUpAt     DateTime?
+  deliveredAt    DateTime?
+  cancelledAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  events   OrderEvent[]
+  rating   Rating?
+  messages ChatMessage[]
+
+  @@index([customerId])
+  @@index([driverId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OrderEvent {
+  id        String      @id @default(cuid())
+  orderId   String
+  order     Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    OrderStatus
+  byUserId  String?
+  note      String?
+  createdAt DateTime    @default(now())
+
+  @@index([orderId])
+}
+
+model Rating {
+  id         String   @id @default(cuid())
+  orderId    String   @unique
+  order      Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customerId String
+  customer   User     @relation("RatingsGiven", fields: [customerId], references: [id])
+  driverId   String
+  driver     User     @relation("RatingsReceived", fields: [driverId], references: [id])
+  stars      Int // 1..5
+  comment    String?
+  createdAt  DateTime @default(now())
+
+  @@index([driverId])
+}
+
+model Tariff {
+  id          String      @id @default(cuid())
+  vehicleType VehicleType
+  name        String // e.g. "Nouakchott — Moto"
+  baseFare    Decimal     @db.Decimal(12, 2) // MRU
+  perKm       Decimal     @db.Decimal(12, 2)
+  perMin      Decimal     @default(0) @db.Decimal(12, 2)
+  minFare     Decimal     @db.Decimal(12, 2)
+  commissionPct Float     @default(15) // platform commission %
+  active      Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([vehicleType, active])
+}
+
+model WalletTransaction {
+  id        String       @id @default(cuid())
+  userId    String
+  user      User         @relation(fields: [userId], references: [id])
+  type      WalletTxType
+  amount    Decimal      @db.Decimal(12, 2) // positive = credit, negative = debit
+  orderId   String?
+  reference String?
+  note      String?
+  createdAt DateTime     @default(now())
+
+  @@index([userId])
+}
+
+model WithdrawalRequest {
+  id            String           @id @default(cuid())
+  driverId      String
+  driver        User             @relation("DriverWithdrawals", fields: [driverId], references: [id])
+  amount        Decimal          @db.Decimal(12, 2)
+  method        PaymentMethod    @default(BANKILY)
+  accountNumber String
+  status        WithdrawalStatus @default(PENDING)
+  processedById String?
+  processedBy   User?            @relation("ProcessedWithdrawals", fields: [processedById], references: [id])
+  processedAt   DateTime?
+  note          String?
+  createdAt     DateTime         @default(now())
+
+  @@index([driverId])
+  @@index([status])
+}
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  senderId  String
+  sender    User     @relation(fields: [senderId], references: [id])
+  text      String
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String? // null = broadcast
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  audience  String   @default("ALL") // ALL | CUSTOMERS | DRIVERS | USER
+  title     String
+  body      String
+  isPromo   Boolean  @default(false)
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Neighborhood {
+  id     String @id @default(cuid())
+  city   String @default("Nouakchott")
+  nameAr String
+  nameFr String
+  lat    Float
+  lng    Float
+
+  @@index([city])
+}
+
+model AppSetting {
+  key   String @id
+  value String
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id])
+  action    String // e.g. DRIVER_APPROVED, TARIFF_UPDATED
+  entity    String?
+  entityId  String?
+  meta      Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([createdAt])
+}
